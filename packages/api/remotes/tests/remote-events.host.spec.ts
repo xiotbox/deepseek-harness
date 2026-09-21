@@ -1,11 +1,13 @@
 import { Context } from '@deepseek-ai/cordis'
 import type { Fiber } from '@deepseek-ai/cordis'
+import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import type {
   RemoteEventHostInfo,
   TypertRemoteEventInvocation,
   TypertRemoteEventSource,
 } from '@deepseek-ai/dsh-api-gateway'
 import { scopeTarget } from '@deepseek-ai/dsh-scope'
+import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import { describe, expect, it } from 'vitest'
 import { apply, inject } from '../src/index.ts'
 
@@ -19,12 +21,19 @@ interface GatewayProbe {
   ): () => Promise<void>
 }
 
-async function setup(): Promise<{
+function stubAgent(id: string): Agent {
+  const agentId = id as Agent['id']
+  return {
+    id: agentId,
+    session: { id: agentId, header: { delegationDepth: 0 } },
+  } as unknown as Agent
+}
+
+async function setup(ctx: Context = new Context()): Promise<{
   readonly ctx: Context
   readonly gateway: GatewayProbe
   readonly fiber: Fiber
 }> {
-  const ctx = new Context()
   const gateway: GatewayProbe = {
     source: undefined,
     host: undefined,
@@ -253,6 +262,74 @@ describe('Remote event Host source', () => {
 
     await rejected
     await expect(delivery).resolves.toEqual({ done: true, value: undefined })
+    await fiber.dispose()
+    await ctx.fiber.dispose()
+  })
+
+  it('forwards a scoped request unchanged, including its cancellation signal', async () => {
+    const { ctx, gateway } = await setup()
+    const abort = new AbortController()
+    const iterator = sourceOf(gateway)(abort.signal)[Symbol.asyncIterator]()
+    const agentCtx = ctx.extend()
+    const agent = { id: 'agent-1', ctx: agentCtx }
+    const signal = new AbortController().signal
+    const request = { questions: [], agent, signal }
+
+    const delegated = waterfallRaw(
+      ctx,
+      scopeTarget(ctx, agent),
+      'user-questions/request',
+      [request],
+      () => Promise.resolve('host fallback'),
+    )
+    const dispatch = invocationOf((await iterator.next()).value)
+    // The forwarded request is the exact object the waterfall received, so the
+    // ask's lifetime signal on it is the signal the Gateway projects and watches.
+    expect(dispatch.request).toBe(request)
+    expect(dispatch.request.signal).toBe(signal)
+    dispatch.resolve({ kind: 'result', value: 'answered' })
+    await expect(delegated).resolves.toBe('answered')
+
+    const done = iterator.next()
+    abort.abort()
+    await expect(done).resolves.toEqual({ done: true, value: undefined })
+    await ctx.fiber.dispose()
+  })
+
+  it('forwards the ask lifetime signal to the request the Gateway watches', async () => {
+    const ctx = new Context()
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(UserQuestionService)
+    const { gateway, fiber } = await setup(ctx)
+    const abort = new AbortController()
+    const iterator = sourceOf(gateway)(abort.signal)[Symbol.asyncIterator]()
+    const agent = stubAgent('agent-1')
+    ctx.agents.enter(agent, undefined)
+    const caller = new AbortController()
+
+    const answered = ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?', options: [{ label: 'yes' }] }],
+      agent,
+      signal: caller.signal,
+    })
+    const dispatch = invocationOf((await iterator.next()).value)
+    // The forwarded request carries the ask's own lifetime signal by
+    // reference, so it is the very signal the Gateway projects and watches.
+    expect(dispatch.request.signal).toBeDefined()
+    expect(dispatch.request.signal).not.toBe(caller.signal)
+    expect(dispatch.request.signal?.aborted).toBe(false)
+
+    dispatch.resolve({ kind: 'result', value: { answers: [{ id: 'confirm', selected: ['yes'] }] } })
+
+    await answered
+    // Settling through the forwarded request ends the ask's presentation
+    // lifetime, which is what cancels every other pending presentation.
+    expect(dispatch.request.signal?.aborted).toBe(true)
+    expect(caller.signal.aborted).toBe(false)
+
+    const done = iterator.next()
+    abort.abort()
+    await expect(done).resolves.toEqual({ done: true, value: undefined })
     await fiber.dispose()
     await ctx.fiber.dispose()
   })

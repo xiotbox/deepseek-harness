@@ -47,7 +47,7 @@ describe('UserQuestionService', () => {
     const result = await ctx.userQuestions.ask({ questions })
 
     expect(result).toEqual({ answers: [{ id: 'confirm', selected: ['yes'] }] })
-    expect(p.seen).toEqual([{ questions }])
+    expect(p.seen).toEqual([{ questions, signal: expect.any(AbortSignal) }])
   })
 
   it('rejects ask requests when no provider is registered', async () => {
@@ -350,5 +350,114 @@ describe('UserQuestionService', () => {
       { id: 'plan-review', selected: ['Approve'] },
     ])
     expect(p.seen[0]?.questions[1]?.intent).toEqual(intent)
+  })
+
+  it('hands the answerers a signal that spans the ask rather than the caller turn', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    const watched: AbortSignal[] = []
+    ctx.on('user-questions/request', (request, next) => {
+      watched.push(request.signal as AbortSignal)
+      return next()
+    })
+    const p = provider('yes')
+    registerAnswerer(ctx, p)
+    const caller = new AbortController()
+
+    const result = await ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?', options: [{ label: 'yes' }] }],
+      signal: caller.signal,
+    })
+
+    expect(result).toEqual({ answers: [{ id: 'confirm', selected: ['yes'] }] })
+    expect(watched).toHaveLength(1)
+    // The forwarded request never carries the caller's turn signal directly:
+    // that would end every pending presentation when the TURN ends.
+    expect(watched[0]).not.toBe(caller.signal)
+    // The ask settled, so its own presentation lifetime ended with it.
+    expect(watched[0]?.aborted).toBe(true)
+    expect(caller.signal.aborted).toBe(false)
+  })
+
+  it('ends the delegated presentation when an earlier answerer claims the question', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    let delegated: AbortSignal | undefined
+    // The competing surface runs first and races the delegation, as a
+    // channel answerer does.
+    ctx.on('user-questions/request', (_request, next) => Promise.race([
+      Promise.resolve({ answers: [{ id: 'confirm', selected: ['claim'] }] }),
+      next(),
+    ]))
+    // The forwarded presentation settles only when its human answers or the
+    // presentation lifetime ends.
+    ctx.on('user-questions/request', (request) => {
+      delegated = request.signal
+      return new Promise<AskUserQuestionAnswer>((_resolve, reject) => {
+        const signal = request.signal
+        if (signal === undefined) return
+        if (signal.aborted) return reject(new Error('presentation cancelled'))
+        signal.addEventListener('abort', () => { reject(new Error('presentation cancelled')) }, { once: true })
+      })
+    })
+
+    const result = await ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?', options: [{ label: 'claim' }] }],
+    })
+
+    expect(result.answers).toEqual([{ id: 'confirm', selected: ['claim'] }])
+    // The forwarded presentation ended with the ask, so it can no longer
+    // collect a second answer for the same question.
+    expect(delegated?.aborted).toBe(true)
+  })
+
+  it('keeps the caller signal as the cancellation authority over the ask lifetime', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    let watched: AbortSignal | undefined
+    registerAnswerer(ctx, {
+      ask(request) {
+        watched = request.signal
+        return new Promise<AskUserQuestionAnswer>((_resolve, reject) => {
+          const signal = request.signal
+          if (signal === undefined) return
+          if (signal.aborted) return reject(new Error('presentation cancelled'))
+          signal.addEventListener('abort', () => { reject(new Error('presentation cancelled')) }, { once: true })
+        })
+      },
+    })
+    const caller = new AbortController()
+    const rejected = expect(ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?' }],
+      signal: caller.signal,
+    })).rejects.toMatchObject({ name: 'UserQuestionError', code: 'ASK_ABORTED' })
+
+    caller.abort(new Error('turn cancelled'))
+
+    await rejected
+    expect(watched?.aborted).toBe(true)
+    expect(watched?.reason).toBe(caller.signal.reason)
+  })
+
+  it('gives every ask its own presentation lifetime', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    const watched: AbortSignal[] = []
+    let previousAlreadyEnded = false
+    ctx.on('user-questions/request', (request, next) => {
+      watched.push(request.signal as AbortSignal)
+      if (watched.length === 2) previousAlreadyEnded = watched[0]?.aborted === true
+      return next()
+    })
+    registerAnswerer(ctx, provider('yes'))
+
+    await ctx.userQuestions.ask({ questions: [{ id: 'q1', question: 'Proceed?' }] })
+    await ctx.userQuestions.ask({ questions: [{ id: 'q2', question: 'Proceed?' }] })
+
+    expect(watched).toHaveLength(2)
+    expect(watched[0]).not.toBe(watched[1])
+    // The earlier ask's lifetime had already ended before the next ask even
+    // reached its answerers, so one ask never shares a lifetime with another.
+    expect(previousAlreadyEnded).toBe(true)
   })
 })

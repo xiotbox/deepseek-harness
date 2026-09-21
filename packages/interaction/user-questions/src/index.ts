@@ -76,6 +76,15 @@ export class UserQuestionService extends Service {
    * block forever, while a lineage-bearing session resumed as a new runtime
    * root may ask normally.
    *
+   * One asked question settles on the FIRST valid answer and owns a
+   * presentation lifetime of its own. `request.signal` spans the caller's
+   * turn, not this question, while every other answer surface listens to the
+   * signal riding the waterfall request — so the ask composes a lifetime
+   * signal in. Settling through any surface, and caller abort alike, aborts
+   * it, which ends the pending presentation still waiting on every other
+   * surface instead of leaving it to be answered twice. `request.signal`
+   * remains the caller's cancellation authority.
+   *
    * @param request Questions, owner agent, and abort signal.
    * @returns The answer chosen or typed by the human.
    * @throws {UserQuestionError} code `ASK_ABORTED` when the supplied signal
@@ -131,13 +140,24 @@ export class UserQuestionService extends Service {
       'no user-questions answerer accepted the request',
       'NO_PROVIDER',
     ))
+    // `request.signal` spans the caller's turn, not this question. One asked
+    // question settles on the FIRST valid answer, and every other answer
+    // surface listens to the signal riding the waterfall request — so the ask
+    // owns a lifetime of its own and composes the caller's in. Settling
+    // through any surface aborts it, which ends the pending presentation still
+    // waiting on every other surface instead of leaving it to be answered
+    // twice. `request.signal` stays the caller's cancellation authority below.
+    const lifetime = new AbortController()
+    const signal = request.signal === undefined
+      ? lifetime.signal
+      : AbortSignal.any([request.signal, lifetime.signal])
     try {
       return await (agent === undefined
-        ? this.ctx.waterfall('user-questions/request', request, noAnswerer)
+        ? this.ctx.waterfall('user-questions/request', { ...request, signal }, noAnswerer)
         : this.ctx.waterfall(
           scopeTarget(agent, agent),
           'user-questions/request',
-          { ...request, agent },
+          { ...request, agent, signal },
           noAnswerer,
         ))
     } catch (error) {
@@ -147,6 +167,8 @@ export class UserQuestionService extends Service {
         throw abortedQuestion(error)
       }
       throw restored
+    } finally {
+      lifetime.abort()
     }
   }
 }

@@ -224,7 +224,12 @@ describe('ask_user_question tool', () => {
       signal: controller.signal,
     })
 
-    expect(seen[0]?.signal).toBe(controller.signal)
+    expect(seen[0]?.signal).toBeDefined()
+    // The request carries a signal that mirrors the caller's: aborting the
+    // tool call aborts the pending question. The ask owns its own lifetime
+    // signal, so the object is composed rather than passed through.
+    controller.abort(new Error('tool call cancelled'))
+    expect(seen[0]?.signal?.aborted).toBe(true)
   })
 
   it('passes optional header and a resumed runtime root through to the user-questions request', async () => {
